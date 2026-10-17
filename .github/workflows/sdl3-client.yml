@@ -1,3 +1,32 @@
+# FreeRDP: A Remote Desktop Protocol Implementation
+#
+# Build only the SDL3 client (`sdl3-freerdp`) and ship a runnable bundle.
+#
+# WHY THIS TRIGGERS ON "SYNC FORK":
+#   GitHub's "Sync fork" button updates a fork by pushing the upstream commits
+#   into the fork's branch. That is a normal push, so it fires the `push`
+#   event below and starts this workflow. It also runs on any manual push to
+#   `master`, and can be started by hand from the Actions tab
+#   ("Run workflow" => workflow_dispatch).
+#
+# ONE-TIME SETUP:
+#   * Actions are disabled by default on forked repositories. Enable them once
+#     under Settings -> Actions -> General ("Allow all actions"), then click
+#     "I understand my workflows, go ahead and enable them" in the Actions tab.
+#   * If the fork is already up to date, "Sync fork" pushes nothing and no
+#     build runs (expected).
+#
+# WHY AN ARCH CONTAINER:
+#   The artifact links against the distro's shared libraries, so it must be
+#   built where the target ABI matches. Ubuntu 26.04 ships FFmpeg 8
+#   (libavcodec.so.62) while Arch/CachyOS ships FFmpeg 9 (libavcodec.so.63).
+#   Building inside `archlinux:base-devel` makes the binary link the same
+#   sonames the machine that runs it has. SDL3 and SDL3_ttf also come from
+#   Arch packages here.
+#
+# ONLY the SDL3 client is produced:
+#   * WITH_CLIENT_SDL=ON + WITH_CLIENT_SDL3=ON + WITH_CLIENT_SDL2=OFF
+#   * the build step builds the single target `sdl3-freerdp`.
 name: sdl3-client
 
 on:
@@ -15,31 +44,28 @@ permissions:
 
 jobs:
   build-sdl3-client:
-    name: Build SDL3 client (Linux)
+    name: Build SDL3 client (Arch Linux)
     runs-on: ubuntu-26.04
+    container: archlinux:base-devel
     timeout-minutes: 90
 
     steps:
+      - name: Install git (needed by checkout)
+        run: pacman -Syu --noconfirm --needed git
+
       - name: Check out source
         uses: actions/checkout@v7
 
       - name: Install build dependencies
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -q -y --no-install-recommends \
-            build-essential cmake ninja-build pkg-config \
-            libssl-dev zlib1g-dev \
-            libsdl3-dev libsdl3-ttf-dev \
-            libavcodec-dev libavformat-dev libavutil-dev \
-            libswscale-dev libswresample-dev \
-            libwayland-dev libwayland-bin wayland-protocols \
-            libxkbcommon-dev libxkbcommon-x11-dev \
-            libx11-dev libxext-dev libxinerama-dev libxcursor-dev \
-            libxrandr-dev libxi-dev libxrender-dev libxfixes-dev \
-            libxtst-dev libxv-dev libxdamage-dev libxkbfile-dev \
-            libpulse-dev libasound2-dev \
-            libusb-1.0-0-dev libudev-dev libcups2-dev libfuse3-dev \
-            uuid-dev libjansson-dev
+          pacman -S --noconfirm --needed \
+            cmake ninja pkgconf \
+            openssl zlib icu systemd-libs \
+            sdl3 sdl3_ttf ffmpeg \
+            wayland wayland-protocols libxkbcommon \
+            libx11 libxext libxinerama libxcursor libxrandr libxi libxrender \
+            libxfixes libxtst libxv libxdamage libxkbfile \
+            libpulse alsa-lib libusb cups jansson util-linux-libs
 
       - name: Configure (SDL3 client only)
         run: |
@@ -54,6 +80,7 @@ jobs:
             -DWITH_MANPAGES=OFF \
             -DWITH_KRB5=OFF \
             -DWITH_PCSC=OFF \
+            -DWITH_FUSE=OFF \
             -DWITH_FFMPEG=ON \
             -DWITH_DSP_FFMPEG=ON \
             -DWITH_VIDEO_FFMPEG=ON \
@@ -69,19 +96,42 @@ jobs:
       - name: Build sdl3-freerdp
         run: cmake --build build --target sdl3-freerdp --parallel
 
-      - name: Collect the client binary
+      - name: Create runnable bundle
         run: |
-          mkdir -p dist
-          # The target is `sdl3-freerdp`; with versioning disabled its output
-          # name is `sdl-freerdp`. Grab whichever exists.
-          find build -type f \( -name 'sdl3-freerdp' -o -name 'sdl-freerdp' \) \
-            -exec cp -v {} dist/ \;
-          test -n "$(ls -A dist)" || { echo "::error::no client binary produced"; exit 1; }
+          set -eux
+          bundle=dist/sdl3-freerdp-linux
+          mkdir -p "$bundle/bin" "$bundle/lib"
+
+          # The client and the FreeRDP libraries it needs (not installed on the host).
+          cp -v build/client/SDL/SDL3/sdl-freerdp "$bundle/bin/"
+          for pat in 'libfreerdp3.so.3*' 'libfreerdp-client3.so.3*' 'libwinpr3.so.3*'; do
+            find build -name "$pat" -exec cp -av {} "$bundle/lib/" \;
+          done
+
+          # Bundle SDL3 / SDL3_ttf so the artifact does not depend on them
+          # being installed on the machine that runs it.
+          cp -av /usr/lib/libSDL3_ttf.so.0* "$bundle/lib/" 2>/dev/null || true
+          cp -av /usr/lib/libSDL3.so.0*     "$bundle/lib/" 2>/dev/null || true
+
+          cat > "$bundle/run-sdl-freerdp.sh" <<'EOF'
+          #!/bin/sh
+          # Run the bundled FreeRDP SDL3 client using its bundled libraries.
+          set -eu
+          here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+          export LD_LIBRARY_PATH="$here/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          exec "$here/bin/sdl-freerdp" "$@"
+          EOF
+          chmod +x "$bundle/run-sdl-freerdp.sh"
+
+          # Smoke test: --version returns before SDL video init (headless-safe).
+          "$bundle/run-sdl-freerdp.sh" --version
+
+          tar -C dist -czf dist/sdl3-freerdp-linux.tar.gz sdl3-freerdp-linux
           ls -l dist
 
-      - name: Upload client binary
+      - name: Upload client bundle
         uses: actions/upload-artifact@v4
         with:
           name: sdl3-freerdp-linux
-          path: dist/
+          path: dist/sdl3-freerdp-linux.tar.gz
           if-no-files-found: error
