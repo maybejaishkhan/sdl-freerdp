@@ -1,0 +1,87 @@
+name: sdl3-client
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+concurrency:
+  group: sdl3-client-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-sdl3-client:
+    name: Build SDL3 client (Linux)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -q -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config \
+            libssl-dev zlib1g-dev \
+            libsdl3-dev libsdl3-ttf-dev \
+            libavcodec-dev libavformat-dev libavutil-dev \
+            libswscale-dev libswresample-dev \
+            libwayland-dev libwayland-bin wayland-protocols \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-dev libxext-dev libxinerama-dev libxcursor-dev \
+            libxrandr-dev libxi-dev libxrender-dev libxfixes-dev \
+            libxtst-dev libxv-dev libxdamage-dev libxkbfile-dev \
+            libpulse-dev libasound2-dev \
+            libusb-1.0-0-dev libudev-dev libcups2-dev \
+            uuid-dev libjansson-dev
+
+      - name: Configure (SDL3 client only)
+        run: |
+          cmake -B build -S . -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DWITH_CLIENT_SDL=ON \
+            -DWITH_CLIENT_SDL3=ON \
+            -DWITH_CLIENT_SDL2=OFF \
+            -DWITHOUT_FREERDP_3x_DEPRECATED=ON \
+            -DWITH_SERVER=OFF \
+            -DWITH_SAMPLE=OFF \
+            -DWITH_MANPAGES=OFF \
+            -DWITH_KRB5=OFF \
+            -DWITH_PCSC=OFF \
+            -DWITH_FFMPEG=ON \
+            -DWITH_DSP_FFMPEG=ON \
+            -DWITH_VIDEO_FFMPEG=ON \
+            -DWITH_SWSCALE=ON
+
+      - name: Verify the SDL3 client target was configured
+        run: |
+          cmake --build build --target help | grep -q 'sdl3-freerdp' || {
+            echo "::error::sdl3-freerdp target was not configured (SDL3 / SDL3_ttf not found?)"
+            exit 1
+          }
+
+      - name: Build sdl3-freerdp
+        run: cmake --build build --target sdl3-freerdp --parallel
+
+      - name: Collect the client binary
+        run: |
+          mkdir -p dist
+          # The target is `sdl3-freerdp`; with versioning disabled its output
+          # name is `sdl-freerdp`. Grab whichever exists.
+          find build -type f \( -name 'sdl3-freerdp' -o -name 'sdl-freerdp' \) \
+            -exec cp -v {} dist/ \;
+          test -n "$(ls -A dist)" || { echo "::error::no client binary produced"; exit 1; }
+          ls -l dist
+
+      - name: Upload client binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdl3-freerdp-linux
+          path: dist/
+          if-no-files-found: error
