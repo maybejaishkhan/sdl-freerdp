@@ -161,21 +161,15 @@ static BOOL shw_post_connect(freerdp* instance)
 
 static DWORD WINAPI shw_client_thread(LPVOID arg)
 {
-	int index;
-	BOOL bSuccess;
-	shwContext* shw;
-	rdpContext* context;
-	rdpChannels* channels;
-
 	freerdp* instance = (freerdp*)arg;
 	WINPR_ASSERT(instance);
 
-	context = (rdpContext*)instance->context;
+	rdpContext* context = (rdpContext*)instance->context;
 	WINPR_ASSERT(context);
 
-	shw = (shwContext*)context;
+	shwContext* shw = (shwContext*)context;
 
-	bSuccess = freerdp_connect(instance);
+	const BOOL bSuccess = freerdp_connect(instance);
 	WLog_INFO(TAG, "freerdp_connect: %d", bSuccess);
 
 	if (!bSuccess)
@@ -184,12 +178,11 @@ static DWORD WINAPI shw_client_thread(LPVOID arg)
 		return 0;
 	}
 
-	channels = context->channels;
+	rdpChannels* channels = context->channels;
 	WINPR_ASSERT(channels);
 
 	while (1)
 	{
-		DWORD status;
 		HANDLE handles[MAXIMUM_WAIT_OBJECTS] = WINPR_C_ARRAY_INIT;
 		DWORD count = freerdp_get_event_handles(instance->context, handles, ARRAYSIZE(handles));
 
@@ -307,11 +300,11 @@ static BOOL shw_freerdp_client_new(freerdp* instance, rdpContext* context)
 		return FALSE;
 	if (!freerdp_settings_set_bool(settings, FreeRDP_BitmapCacheV3Enabled, FALSE))
 		return FALSE;
-	if (!freerdp_settings_set_bool(settings, FreeRDP_OffscreenSupportLevel, FALSE))
+	if (!freerdp_settings_set_uint32(settings, FreeRDP_OffscreenSupportLevel, 0))
 		return FALSE;
 	if (!freerdp_settings_set_uint32(settings, FreeRDP_GlyphSupportLevel, GLYPH_SUPPORT_NONE))
 		return FALSE;
-	if (!freerdp_settings_set_bool(settings, FreeRDP_BrushSupportLevel, FALSE))
+	if (!freerdp_settings_set_uint32(settings, FreeRDP_BrushSupportLevel, 0))
 		return FALSE;
 	ZeroMemory(freerdp_settings_get_pointer_writable(settings, FreeRDP_OrderSupport), 32);
 	if (!freerdp_settings_set_bool(settings, FreeRDP_FrameMarkerCommandEnabled, TRUE))
@@ -330,7 +323,7 @@ static BOOL shw_freerdp_client_new(freerdp* instance, rdpContext* context)
 		return FALSE;
 	if (!freerdp_settings_set_bool(settings, FreeRDP_FastPathOutput, TRUE))
 		return FALSE;
-	if (!freerdp_settings_set_bool(settings, FreeRDP_LargePointerFlag, TRUE))
+	if (!freerdp_settings_set_uint32(settings, FreeRDP_LargePointerFlag, 1))
 		return FALSE;
 	if (!freerdp_settings_set_bool(settings, FreeRDP_CompressionEnabled, FALSE))
 		return FALSE;
