@@ -238,6 +238,27 @@ void SdlRailWindow::markDeleted()
 	_deleted = true;
 }
 
+void SdlRailWindow::releaseWindow()
+{
+	std::unique_lock lock(_gfxLock);
+	if (!_win)
+		return;
+	WLog_DBG(TAG, "release id=0x%08" PRIx32 " %s%s", static_cast<uint32_t>(_id), role(),
+	         _deleted ? "" : " (SDL parent gone, re-created on next pass)");
+	_win.reset();
+	/* Back to the "never created" state: create() + first frame + map run again. */
+	_mapped = false;
+	_painted = false;
+	_gfxPresented = false;
+	_needsFullBlit = true;
+	_geometryDirty = true;
+	_parentApplied = false;
+	_fullscreen = false;
+	_appliedInsets = { 0, 0, 0, 0 };
+	_extentsApplied = { 0, 0, 0, 0 };
+	_lastWinW = _lastWinH = _lastGfxW = _lastGfxH = 0;
+}
+
 bool SdlRailWindow::isDeleted() const
 {
 	std::unique_lock lock(_gfxLock);
@@ -1208,19 +1229,17 @@ bool SdlRailWindow::paint(SDL_Surface* primary, SDL_PixelFormat fallbackFormat,
 	if (!reconcile(parent, parentRect))
 		return false;
 
-	bool ok = false;
+	auto ok = false;
+	auto legacy = false;
 	{
 		std::unique_lock lock(_gfxLock);
 		if (_hasGfx)
-		{
 			ok = paintGfx(fallbackFormat);
-		}
 		else
-		{
-			lock.unlock();
-			ok = paintLegacy(primary, damage);
-		}
+			legacy = true;
 	}
+	if (legacy)
+		ok = paintLegacy(primary, damage);
 
 	/* Map in the same pass as the first frame, else the window defers a frame (menu lag). */
 	if (_gfxPresented && !_mapped && !_minState.rail)
