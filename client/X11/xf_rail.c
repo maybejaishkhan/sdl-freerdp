@@ -430,11 +430,13 @@ BOOL xf_rail_paint_surface(xfContext* xfc, UINT64 windowId, const RECTANGLE_16* 
 	}
 	rc = TRUE;
 fail:
+{
 	const UINT32 surfaceId = appWindow->surfaceId;
 	region16_uninit(&windowInvalidRegion);
 	xf_rail_return_window(appWindow, FALSE);
 	if (redraw)
 		xf_AppWindowRepaintFromSurface(xfc, windowId, surfaceId);
+}
 	return rc;
 }
 
@@ -537,7 +539,9 @@ static BOOL xf_rail_window_common(rdpContext* context, const WINDOW_ORDER_INFO* 
 		if (!appWindow->title)
 			goto fail;
 
-		if (xf_AppWindowInit(xfc, appWindow))
+		const BOOL hidden = ((fieldFlags & WINDOW_ORDER_FIELD_SHOW) != 0) &&
+		                    (windowState->showState == WINDOW_HIDE);
+		if (xf_AppWindowInit(xfc, appWindow, hidden))
 			redraw = TRUE;
 	}
 

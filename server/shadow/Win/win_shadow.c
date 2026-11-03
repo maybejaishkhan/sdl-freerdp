@@ -28,6 +28,8 @@
 #include <freerdp/server/server-common.h>
 
 #include "win_shadow.h"
+#include "win_sas.h"
+#include "win_audio.h"
 
 #define TAG SERVER_TAG("shadow.win")
 
@@ -37,6 +39,88 @@
 #ifndef MOUSEEVENTF_HWHEEL
 #define MOUSEEVENTF_HWHEEL 0x1000
 #endif
+
+/* The desktop this thread opened to follow the input desktop, if any */
+static WINPR_TLS HDESK win_shadow_thread_desktop = nullptr;
+
+/* Moves the calling thread to the input desktop when that changed: SendInput
+ * and DXGI desktop duplication only work there. The input desktop is the
+ * user's (Default) or, as SYSTEM on the console session (the service mode),
+ * the secure one (Winlogon: the logon and lock screens, UAC prompts). A user
+ * process cannot open the secure desktop and stays where it is. Returns TRUE
+ * when the thread moved. */
+WINPR_ATTR_NODISCARD
+static BOOL win_shadow_follow_input_desktop(void)
+{
+	WCHAR inputName[64] = WINPR_C_ARRAY_INIT;
+	WCHAR threadName[64] = WINPR_C_ARRAY_INIT;
+	HDESK input = OpenInputDesktop(0, FALSE, GENERIC_ALL);
+
+	if (!input)
+		return FALSE;
+
+	if (!GetUserObjectInformationW(input, UOI_NAME, inputName, sizeof(inputName), nullptr))
+		WLog_WARN(TAG, "GetUserObjectInformationW(input desktop, UOI_NAME) failed: 0x%08lX",
+		          GetLastError());
+	if (!GetUserObjectInformationW(GetThreadDesktop(GetCurrentThreadId()), UOI_NAME, threadName,
+	                               sizeof(threadName), nullptr))
+		WLog_WARN(TAG, "GetUserObjectInformationW(thread desktop, UOI_NAME) failed: 0x%08lX",
+		          GetLastError());
+
+	if (_wcsicmp(inputName, threadName) == 0)
+	{
+		(void)CloseDesktop(input);
+		return FALSE;
+	}
+
+	if (!SetThreadDesktop(input))
+	{
+		WLog_WARN(TAG, "SetThreadDesktop(%ls) failed: 0x%08lX", inputName, GetLastError());
+		(void)CloseDesktop(input);
+		return FALSE;
+	}
+
+	/* the desktop GetThreadDesktop() gave first is not ours to close */
+	if (win_shadow_thread_desktop)
+		(void)CloseDesktop(win_shadow_thread_desktop);
+	win_shadow_thread_desktop = input;
+	WLog_INFO(TAG, "thread %lu follows the input desktop from %ls to %ls", GetCurrentThreadId(),
+	          threadName, inputName);
+	return TRUE;
+}
+
+/* SendInput, without ending the session when Windows refuses the event: it
+ * does while the input desktop switches (the secure desktop comes or goes)
+ * and for a window above our integrity level, and FreeRDP drops the client
+ * when an input handler fails */
+static void win_shadow_send_input(INPUT* event)
+{
+	WINPR_ASSERT(event);
+
+	if (SendInput(1, event, sizeof(INPUT)) == 0)
+		WLog_WARN(TAG, "SendInput refused the event (0x%08lX), it is dropped", GetLastError());
+}
+
+/* Ctrl+Alt+Del: asks freerdp-shadow-service for the secure attention
+ * sequence (win_sas.h) */
+static void win_shadow_send_sas(void)
+{
+	HANDLE event = OpenEventW(EVENT_MODIFY_STATE, FALSE, WIN_SHADOW_SAS_EVENT);
+
+	if (!event)
+	{
+		WLog_WARN(TAG, "Ctrl+Alt+Del: no freerdp-shadow-service to send it (0x%08lX)",
+		          GetLastError());
+		return;
+	}
+
+	if (SetEvent(event))
+		WLog_INFO(TAG,
+		          "Ctrl+Alt+Del: asked freerdp-shadow-service for the secure attention sequence");
+	else
+		WLog_WARN(TAG, "Ctrl+Alt+Del: SetEvent failed (0x%08lX)", GetLastError());
+	(void)CloseHandle(event);
+}
 
 static BOOL win_shadow_input_synchronize_event(rdpShadowSubsystem* subsystem,
                                                rdpShadowClient* client, UINT32 flags)
@@ -48,6 +132,24 @@ static BOOL win_shadow_input_synchronize_event(rdpShadowSubsystem* subsystem,
 static BOOL win_shadow_input_keyboard_event(rdpShadowSubsystem* subsystem, rdpShadowClient* client,
                                             UINT16 flags, UINT8 code)
 {
+	winShadowSubsystem* win = (winShadowSubsystem*)subsystem;
+	const BOOL down = (flags & KBD_FLAGS_RELEASE) == 0;
+
+	WINPR_ASSERT(win);
+	(void)win_shadow_follow_input_desktop();
+
+	/* scan codes: Ctrl 0x1D, Alt 0x38 (the right ones extended), Delete
+	 * 0x53 (the keypad's not extended); Windows takes either Delete */
+	if (code == 0x1D)
+		win->ctrlDown = down;
+	else if (code == 0x38)
+		win->altDown = down;
+	else if ((code == 0x53) && win->ctrlDown && win->altDown)
+	{
+		if (down)
+			win_shadow_send_sas();
+		return TRUE; /* never typed into the desktop */
+	}
 	INPUT event = WINPR_C_ARRAY_INIT;
 	event.type = INPUT_KEYBOARD;
 	KEYBDINPUT* ki =
@@ -69,9 +171,7 @@ static BOOL win_shadow_input_keyboard_event(rdpShadowSubsystem* subsystem, rdpSh
 	if (flags & KBD_FLAGS_EXTENDED)
 		ki->dwFlags |= KEYEVENTF_EXTENDEDKEY;
 
-	const UINT rc = SendInput(1, &event, sizeof(INPUT));
-	if (rc == 0)
-		return FALSE;
+	win_shadow_send_input(&event);
 	return TRUE;
 }
 
@@ -79,6 +179,7 @@ static BOOL win_shadow_input_unicode_keyboard_event(rdpShadowSubsystem* subsyste
                                                     rdpShadowClient* client, UINT16 flags,
                                                     UINT16 code)
 {
+	(void)win_shadow_follow_input_desktop();
 	INPUT event = WINPR_C_ARRAY_INIT;
 	event.type = INPUT_KEYBOARD;
 	KEYBDINPUT* ki =
@@ -96,16 +197,14 @@ static BOOL win_shadow_input_unicode_keyboard_event(rdpShadowSubsystem* subsyste
 	if (flags & KBD_FLAGS_RELEASE)
 		ki->dwFlags |= KEYEVENTF_KEYUP;
 
-	const UINT rc = SendInput(1, &event, sizeof(INPUT));
-	if (rc == 0)
-		return FALSE;
+	win_shadow_send_input(&event);
 	return TRUE;
 }
 
 static BOOL win_shadow_input_mouse_event(rdpShadowSubsystem* subsystem, rdpShadowClient* client,
                                          UINT16 flags, UINT16 x, UINT16 y)
 {
-	UINT rc = 1;
+	(void)win_shadow_follow_input_desktop();
 	INPUT event = WINPR_C_ARRAY_INIT;
 	float width;
 	float height;
@@ -129,16 +228,7 @@ static BOOL win_shadow_input_mouse_event(rdpShadowSubsystem* subsystem, rdpShado
 		if (flags & PTR_FLAGS_WHEEL_NEGATIVE)
 			mi->mouseData *= -1;
 
-		rc = SendInput(1, &event, sizeof(INPUT));
-
-		/* The build target is a system that did not support MOUSEEVENTF_HWHEEL
-		 * but it may run on newer systems supporting it.
-		 * Ignore the return value in these cases.
-		 */
-#if (_WIN32_WINNT < 0x0600)
-		if (flags & PTR_FLAGS_HWHEEL)
-			rc = 1;
-#endif
+		win_shadow_send_input(&event);
 	}
 	else
 	{
@@ -151,9 +241,7 @@ static BOOL win_shadow_input_mouse_event(rdpShadowSubsystem* subsystem, rdpShado
 		if (flags & PTR_FLAGS_MOVE)
 		{
 			mi->dwFlags |= MOUSEEVENTF_MOVE;
-			rc = SendInput(1, &event, sizeof(INPUT));
-			if (rc == 0)
-				return FALSE;
+			win_shadow_send_input(&event);
 		}
 
 		mi->dwFlags = MOUSEEVENTF_ABSOLUTE;
@@ -165,7 +253,7 @@ static BOOL win_shadow_input_mouse_event(rdpShadowSubsystem* subsystem, rdpShado
 			else
 				mi->dwFlags |= MOUSEEVENTF_LEFTUP;
 
-			rc = SendInput(1, &event, sizeof(INPUT));
+			win_shadow_send_input(&event);
 		}
 		else if (flags & PTR_FLAGS_BUTTON2)
 		{
@@ -174,7 +262,7 @@ static BOOL win_shadow_input_mouse_event(rdpShadowSubsystem* subsystem, rdpShado
 			else
 				mi->dwFlags |= MOUSEEVENTF_RIGHTUP;
 
-			rc = SendInput(1, &event, sizeof(INPUT));
+			win_shadow_send_input(&event);
 		}
 		else if (flags & PTR_FLAGS_BUTTON3)
 		{
@@ -183,12 +271,10 @@ static BOOL win_shadow_input_mouse_event(rdpShadowSubsystem* subsystem, rdpShado
 			else
 				mi->dwFlags |= MOUSEEVENTF_MIDDLEUP;
 
-			rc = SendInput(1, &event, sizeof(INPUT));
+			win_shadow_send_input(&event);
 		}
 	}
 
-	if (rc == 0)
-		return FALSE;
 	return TRUE;
 }
 
@@ -196,7 +282,7 @@ static BOOL win_shadow_input_extended_mouse_event(rdpShadowSubsystem* subsystem,
                                                   rdpShadowClient* client, UINT16 flags, UINT16 x,
                                                   UINT16 y)
 {
-	UINT rc = 1;
+	(void)win_shadow_follow_input_desktop();
 	INPUT event = WINPR_C_ARRAY_INIT;
 	float width;
 	float height;
@@ -218,9 +304,7 @@ static BOOL win_shadow_input_extended_mouse_event(rdpShadowSubsystem* subsystem,
 			mi->dx = (LONG)((float)x * (65535.0f / width));
 			mi->dy = (LONG)((float)y * (65535.0f / height));
 			mi->dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE;
-			rc = SendInput(1, &event, sizeof(INPUT));
-			if (rc == 0)
-				return FALSE;
+			win_shadow_send_input(&event);
 		}
 
 		mi->dx = mi->dy = mi->dwFlags = 0;
@@ -235,11 +319,9 @@ static BOOL win_shadow_input_extended_mouse_event(rdpShadowSubsystem* subsystem,
 		else if (flags & PTR_XFLAGS_BUTTON2)
 			mi->mouseData = XBUTTON2;
 
-		rc = SendInput(1, &event, sizeof(INPUT));
+		win_shadow_send_input(&event);
 	}
 
-	if (rc == 0)
-		return FALSE;
 	return TRUE;
 }
 
@@ -291,6 +373,18 @@ static int win_shadow_surface_copy(winShadowSubsystem* subsystem)
 	y = invalidRect.top;
 	width = invalidRect.right - invalidRect.left;
 	height = invalidRect.bottom - invalidRect.top;
+
+	/* The alignment to 16 pixels may reach past the captured screen when its
+	 * size is not a multiple of 16 (1600x900): copy what was captured only */
+	if (x + width > subsystem->width)
+		width = subsystem->width - x;
+	if (y + height > subsystem->height)
+		height = subsystem->height - y;
+	if ((width <= 0) || (height <= 0))
+	{
+		region16_clear(&(surface->invalidRegion));
+		return 1;
+	}
 
 	if (0)
 	{
@@ -405,11 +499,15 @@ static DWORD WINAPI win_shadow_subsystem_thread(LPVOID arg)
 	HANDLE events[32];
 	HANDLE StopEvent;
 	StopEvent = subsystem->base.server->StopEvent;
+	wMessagePipe* MsgPipe = subsystem->base.MsgPipe;
+	WINPR_ASSERT(MsgPipe);
 	nCount = 0;
 	events[nCount++] = StopEvent;
+	events[nCount++] = MessageQueue_Event(MsgPipe->In);
 	subsystem->base.captureFrameRate = 120;
 	dwInterval = 1000 / subsystem->base.captureFrameRate;
 	frameTime = GetTickCount64() + dwInterval;
+	BOOL refresh = FALSE;
 
 	while (1)
 	{
@@ -423,13 +521,55 @@ static DWORD WINAPI win_shadow_subsystem_thread(LPVOID arg)
 			break;
 		}
 
+		/* a client asks for the whole screen (its graphics channel is
+		 * ready, or it asked to refresh), as the X11 subsystem answers */
+		wMessage message = WINPR_C_ARRAY_INIT;
+		BOOL quit = FALSE;
+		while (!quit && MessageQueue_Peek(MsgPipe->In, &message, TRUE))
+		{
+			quit = (message.id == WMQ_QUIT);
+			if (message.id == SHADOW_MSG_IN_REFRESH_REQUEST_ID)
+				refresh = TRUE;
+			if (message.Free)
+				message.Free(&message);
+		}
+		if (quit)
+			break;
+
 		if ((status == WAIT_TIMEOUT) || (GetTickCount64() > frameTime))
 		{
-			int dxgi_status;
-			dxgi_status = win_shadow_dxgi_get_next_frame(subsystem);
+			int dxgi_status = 0;
 
+			/* a desktop switch (logon, lock screen, UAC), a refresh request,
+			 * or no duplication yet: duplicate the output again on the input
+			 * desktop, and send all of it. DXGI reports changes only: on a
+			 * desktop that does not change, a new client would otherwise wait
+			 * for its first picture until something moves; a new duplication
+			 * starts with the whole desktop image */
+			if (win_shadow_follow_input_desktop() || refresh || !subsystem->dxgiOutputDuplication)
+			{
+				refresh = FALSE;
+				if (win_shadow_dxgi_restart_duplication(subsystem) > 0)
+					(void)win_shadow_invalidate_region(subsystem, 0, 0, subsystem->width,
+					                                   subsystem->height);
+			}
+
+			if (subsystem->dxgiOutputDuplication)
+				dxgi_status = win_shadow_dxgi_get_next_frame(subsystem);
+
+			/* a frame without dirty rectangles of its own (the first of a
+			 * new duplication) still holds the whole desktop image: copy
+			 * what is marked invalid already */
 			if (dxgi_status > 0)
-				dxgi_status = win_shadow_dxgi_get_invalid_region(subsystem);
+			{
+				const int changed = win_shadow_dxgi_get_invalid_region(subsystem);
+				rdpShadowSurface* surface = subsystem->base.server->surface;
+				WINPR_ASSERT(surface);
+				EnterCriticalSection(&(surface->lock));
+				const BOOL pending = !region16_is_empty(&(surface->invalidRegion));
+				LeaveCriticalSection(&(surface->lock));
+				dxgi_status = ((changed > 0) || ((changed == 0) && pending)) ? 1 : changed;
+			}
 
 			if (dxgi_status > 0)
 				win_shadow_surface_copy(subsystem);
@@ -524,8 +664,9 @@ static UINT32 win_shadow_enum_monitors(MONITOR_DEF* monitors, UINT32 maxMonitors
 		monitor = &monitors[index];
 		monitor->left = 0;
 		monitor->top = 0;
-		monitor->right = desktopWidth;
-		monitor->bottom = desktopHeight;
+		/* right and bottom are inclusive, as the shadow server reads them */
+		monitor->right = desktopWidth - 1;
+		monitor->bottom = desktopHeight - 1;
 		monitor->flags = 1;
 		DeleteDC(hdc);
 	}
@@ -538,8 +679,8 @@ static UINT32 win_shadow_enum_monitors(MONITOR_DEF* monitors, UINT32 maxMonitors
 		monitor = &monitors[0];
 		monitor->left = 0;
 		monitor->top = 0;
-		monitor->right = GetSystemMetrics(SM_CXSCREEN);
-		monitor->bottom = GetSystemMetrics(SM_CYSCREEN);
+		monitor->right = GetSystemMetrics(SM_CXSCREEN) - 1;
+		monitor->bottom = GetSystemMetrics(SM_CYSCREEN) - 1;
 		monitor->flags = 1;
 		numMonitors = 1;
 	}
@@ -555,8 +696,9 @@ static int win_shadow_subsystem_init(rdpShadowSubsystem* arg)
 	subsystem->base.numMonitors = win_shadow_enum_monitors(subsystem->base.monitors, 16);
 	if (subsystem->base.numMonitors > 0)
 	{
-		subsystem->width = subsystem->base.monitors[0].right;
-		subsystem->height = subsystem->base.monitors[0].bottom;
+		const MONITOR_DEF* primary = &subsystem->base.monitors[0];
+		subsystem->width = primary->right - primary->left + 1;
+		subsystem->height = primary->bottom - primary->top + 1;
 	}
 
 	if ((subsystem->width <= 0) || (subsystem->height <= 0))
@@ -572,10 +714,13 @@ static int win_shadow_subsystem_init(rdpShadowSubsystem* arg)
 	virtualScreen = &(subsystem->base.virtualScreen);
 	virtualScreen->left = 0;
 	virtualScreen->top = 0;
-	virtualScreen->right = subsystem->width;
-	virtualScreen->bottom = subsystem->height;
+	virtualScreen->right = subsystem->width - 1;
+	virtualScreen->bottom = subsystem->height - 1;
 	virtualScreen->flags = 1;
 	WLog_INFO(TAG, "width: %d height: %d", subsystem->width, subsystem->height);
+
+	if (!win_shadow_audio_init(subsystem))
+		WLog_WARN(TAG, "audio: no formats to offer: no sound");
 	return 1;
 }
 
@@ -586,6 +731,7 @@ static int win_shadow_subsystem_uninit(rdpShadowSubsystem* arg)
 	if (!subsystem)
 		return -1;
 
+	win_shadow_audio_uninit(subsystem);
 #if defined(WITH_WDS_API)
 	win_shadow_wds_uninit(subsystem);
 #elif defined(WITH_DXGI_1_2)
@@ -609,6 +755,9 @@ static int win_shadow_subsystem_start(rdpShadowSubsystem* arg)
 		return -1;
 	}
 
+	/* the picture works without the sound */
+	if (!win_shadow_audio_start(subsystem))
+		WLog_WARN(TAG, "audio: no capture thread: no sound");
 	return 1;
 }
 
@@ -619,6 +768,7 @@ static int win_shadow_subsystem_stop(rdpShadowSubsystem* arg)
 	if (!subsystem)
 		return -1;
 
+	win_shadow_audio_stop(subsystem);
 	return 1;
 }
 

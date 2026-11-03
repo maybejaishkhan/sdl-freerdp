@@ -452,7 +452,30 @@ static UINT cliprdr_order_recv(LPVOID userdata, wStream* s)
 	Stream_Read_UINT16(s, msgFlags); /* msgFlags (2 bytes) */
 	Stream_Read_UINT32(s, dataLen);  /* dataLen (4 bytes) */
 
-	if (!Stream_CheckAndLogRequiredLengthWLog(cliprdr->log, s, dataLen))
+	const BOOL failedResponse =
+	    (msgFlags & CB_RESPONSE_FAIL) &&
+	    ((msgType == CB_FORMAT_DATA_RESPONSE) || (msgType == CB_FORMAT_LIST_RESPONSE) ||
+		 (msgType == CB_FILECONTENTS_RESPONSE));
+	if (failedResponse)
+	{
+		/* A failed response carries no payload, MS-RDPECLIP defines dataLen == 0 for it. Not
+		 * every server gets that right though: gnome-remote-desktop 50.x sends dataLen > 0
+		 * with no data behind it after it could not produce the requested clipboard format.
+		 * Insisting on dataLen bytes fails the channel, and a failed channel tears down the
+		 * whole session - a clipboard problem must not kill the connection. Treat dataLen as a
+		 * hint for a failed response and pass on what actually arrived; the message flag
+		 * already tells the handler that there is nothing to read. */
+		const size_t available = Stream_GetRemainingLength(s);
+		if (dataLen > available)
+		{
+			WLog_Print(cliprdr->log, WLOG_WARN,
+			           "failed response (msgType: %" PRIu16 ") claims dataLen: %" PRIu32
+			           " but only %" PRIuz " bytes follow",
+			           msgType, dataLen, available);
+			dataLen = WINPR_ASSERTING_INT_CAST(UINT32, available);
+		}
+	}
+	else if (!Stream_CheckAndLogRequiredLengthWLog(cliprdr->log, s, dataLen))
 		return ERROR_INVALID_DATA;
 
 	char buffer1[64] = WINPR_C_ARRAY_INIT;
@@ -612,8 +635,6 @@ static UINT cliprdr_client_capabilities(CliprdrClientContext* context,
 	Stream_Write_UINT32(s, flags); /* generalFlags */
 	WLog_Print(cliprdr->log, WLOG_DEBUG, "ClientCapabilities");
 
-	cliprdr->initialFormatListSent = FALSE;
-
 	return cliprdr_packet_send(cliprdr, s);
 }
 
@@ -689,12 +710,11 @@ static UINT cliprdr_client_format_list(CliprdrClientContext* context,
 	    formatList, mask, CLIPRDR_FLAG_LOCAL_TO_REMOTE | CLIPRDR_FLAG_LOCAL_TO_REMOTE_FILES);
 
 	/* Allow initial format list from monitor ready, but ignore later attempts */
-	if ((filterList.numFormats == 0) && cliprdr->initialFormatListSent)
+	if (filterList.numFormats == 0)
 	{
 		cliprdr_free_format_list(&filterList);
 		return CHANNEL_RC_OK;
 	}
-	cliprdr->initialFormatListSent = TRUE;
 
 	const uint32_t level = WLOG_DEBUG;
 	if (WLog_IsLevelActive(cliprdr->log, level))
